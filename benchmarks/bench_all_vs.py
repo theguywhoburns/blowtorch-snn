@@ -74,7 +74,7 @@ def bench_blowtorch(name: str, variant: str) -> float:
         # so each compiled run gets a clean, unbounded-by-cache budget and every
         # neuron is genuinely measured as compiled, not silently eager.
         torch._dynamo.reset()
-        neuron.fast_sequence_(mode="max-autotune-no-cudagraphs")
+        neuron.fast_sequence_(mode="default")
 
     x_seq = torch.randn(T, BATCH, FEATURES, device=DEVICE)
     state = None
