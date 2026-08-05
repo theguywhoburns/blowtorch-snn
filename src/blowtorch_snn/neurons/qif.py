@@ -9,6 +9,7 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
+    _constrain_if_learnable,
     clamp_positive,
     identity,
     subtract_reset,
@@ -85,8 +86,10 @@ class QIF(SpikingModule):
         return tuple(values)
 
     def _step(self, x: Tensor, mem: Tensor) -> tuple[Tensor, Tensor]:
-        beta = self.beta_constraint(self.beta)
-        threshold = self.threshold_constraint(self.threshold)
+        beta = _constrain_if_learnable(self.beta, self.beta_constraint)
+        threshold = _constrain_if_learnable(
+            self.threshold, self.threshold_constraint
+        )
         mem = mem + beta * ((mem - self.v_rest) * (mem - self.v_thresh) + self.membrane_resistance * x)
         if self.v_min is not None:
             mem = torch.clamp(mem, min=self.v_min)

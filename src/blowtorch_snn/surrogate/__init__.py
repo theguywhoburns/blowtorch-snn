@@ -18,6 +18,20 @@ class _Spike(torch.autograd.Function):
         return ctx.surrogate_fn(x) * grad_outputs[0], None
 
 
+def _spike(x: torch.Tensor, surrogate_fn: Callable[[torch.Tensor], torch.Tensor]):
+    """Hard-threshold spike with surrogate-gradient backward.
+
+    Under ``torch.no_grad()``/``inference_mode`` (inference and benchmarking)
+    the autograd ``Function.apply`` machinery is pure overhead: no gradient is
+    ever requested, yet ``apply`` still runs the ``ctx.save_for_backward`` /
+    ``setup_context`` bookkeeping. Bypass it with the identical forward
+    computation so eager inference skips the per-step autograd plumbing.
+    """
+    if torch.is_grad_enabled():
+        return _Spike.apply(x, surrogate_fn)
+    return (x > 0).to(x.dtype)
+
+
 def _heaviside(x: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(x)
 
@@ -66,29 +80,29 @@ def _rectangular(x: torch.Tensor, width: float) -> torch.Tensor:
 def heaviside() -> SpikeGrad:
     """Unit-gradient surrogate: hard Heaviside forward, identity backward
     (the gradient passes through unchanged)."""
-    return lambda x: _Spike.apply(x, _heaviside)
+    return lambda x: _spike(x, _heaviside)
 
 
 def fast_sigmoid(slope: float = 25.0) -> SpikeGrad:
-    return lambda x: _Spike.apply(x, lambda x: _fast_sigmoid(x, slope))
+    return lambda x: _spike(x, lambda x: _fast_sigmoid(x, slope))
 
 
 def atan(alpha: float = 2.0) -> SpikeGrad:
-    return lambda x: _Spike.apply(x, lambda x: _atan(x, alpha))
+    return lambda x: _spike(x, lambda x: _atan(x, alpha))
 
 
 def triangular(threshold: float = 1.0) -> SpikeGrad:
-    return lambda x: _Spike.apply(x, lambda x: _triangular(x, threshold))
+    return lambda x: _spike(x, lambda x: _triangular(x, threshold))
 
 
 def sigmoid(slope: float = 25.0) -> SpikeGrad:
     """Vanilla logistic surrogate gradient: ``sigmoid(slope * x)``."""
-    return lambda x: _Spike.apply(x, lambda x: _sigmoid(x, slope))
+    return lambda x: _spike(x, lambda x: _sigmoid(x, slope))
 
 
 def gaussian(sigma: float = 1.0) -> SpikeGrad:
     """Gaussian surrogate gradient, normalized so it integrates to one."""
-    return lambda x: _Spike.apply(x, lambda x: _gaussian(x, sigma))
+    return lambda x: _spike(x, lambda x: _gaussian(x, sigma))
 
 
 def multi_gaussian(
@@ -97,14 +111,12 @@ def multi_gaussian(
     separation: float = 1.0,
 ) -> SpikeGrad:
     """Two-gaussian surrogate: a tall primary lobe plus a weaker offset one."""
-    return lambda x: _Spike.apply(
-        x, lambda x: _multi_gaussian(x, sigma, height, separation)
-    )
+    return lambda x: _spike(x, lambda x: _multi_gaussian(x, sigma, height, separation))
 
 
 def rectangular(width: float = 1.0) -> SpikeGrad:
     """Rectangular window of ``1 / width`` inside ``[-width/2, width/2]``."""
-    return lambda x: _Spike.apply(x, lambda x: _rectangular(x, width))
+    return lambda x: _spike(x, lambda x: _rectangular(x, width))
 
 
 def straight_through() -> SpikeGrad:

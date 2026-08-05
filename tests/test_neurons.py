@@ -238,6 +238,26 @@ def test_constraints_apply_per_neuron():
     assert spk.shape == X.shape
 
 
+def test_constraint_skipped_for_fixed_params():
+    lif = LIF(beta=2.0, init_hidden=True)
+    beta, threshold = lif._constrained_params()
+    # Constrained once at init into a non-trainable buffer...
+    assert isinstance(lif.beta, torch.Tensor)
+    assert not isinstance(lif.beta, torch.nn.Parameter)
+    assert beta.item() == 1.0  # clamp_unit_interval applied once at init
+    assert threshold.item() == 1.0
+    # ...and returned unchanged at runtime (identity constraint).
+    assert beta is lif.beta
+
+
+def test_constraint_applied_for_learnable_params():
+    lif = LIF(beta=2.0, learnable_beta=True, init_hidden=True)
+    beta, threshold = lif._constrained_params()
+    assert beta is not lif.beta
+    assert beta.item() == 1.0  # clamped to the [0, 1] unit range
+    assert threshold is lif.threshold
+
+
 def test_default_beta_constraint_clamps_to_unit_range():
     lif = LIF(beta=2.0, learnable_beta=True, init_hidden=True)
     assert lif.beta_constraint(torch.tensor(2.0)).item() == 1.0

@@ -3,6 +3,7 @@ import torch.nn as nn
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Literal, Optional, TypedDict, Unpack
 
 Tensor = torch.Tensor
@@ -12,6 +13,12 @@ NeuronOutput = Tensor | tuple[Tensor, ...]
 ResetFn = Callable[[Tensor, Tensor, Tensor], Tensor]
 
 TensorConstraint = Callable[[Tensor], Tensor]
+
+#: Declared min/max bound for a state. ``None`` (or ``(None, None)``) means no
+#: range; ``(lo, None)`` keeps values at least ``lo``; ``(None, hi)`` keeps them
+#: at most ``hi``; ``(lo, hi)`` keeps them inside ``[lo, hi]``. Bounds are
+#: inclusive.
+ValueRange = tuple[Optional[float], Optional[float]]
 
 Forward = Callable[..., NeuronOutput]
 
@@ -79,6 +86,61 @@ class SpikingModuleKwargs(TypedDict, total=False):
 
 
 @dataclass(frozen=True)
+class RangeSpec:
+    """Declarative bound for a state tensor.
+
+    ``clamp`` is the execution-time behavior. ``warn`` and ``error`` are
+    diagnostic behaviors used only when validation/debug checks are enabled.
+    """
+
+    low: Optional[float] = None
+    high: Optional[float] = None
+
+    #: Execution-time enforcement. If True, values are clamped into range.
+    clamp: bool = True
+
+    #: Debug/validation only: warn when a violation is observed.
+    warn: bool = False
+
+    #: Debug/validation only: raise when a violation is observed.
+    #: If both ``warn`` and ``error`` are true, ``error`` wins.
+    error: bool = False
+
+    #: Diagnostic tolerance for warn/error checks.
+    tol: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.low is None and self.high is None:
+            raise ValueError("RangeSpec requires at least one bound")
+
+        if (
+            self.low is not None
+            and self.high is not None
+            and self.low > self.high
+        ):
+            raise ValueError(
+                f"RangeSpec low must be <= high, got {self.low} > {self.high}"
+            )
+
+    def violates(self, t: Tensor) -> bool:
+        """Debug-only violation check. Expensive; not for hot paths."""
+        if self.low is not None:
+            if bool((t < self.low - self.tol).any()):
+                return True
+
+        if self.high is not None:
+            if bool((t > self.high + self.tol).any()):
+                return True
+
+        return False
+
+    def describe(self) -> str:
+        low = "-inf" if self.low is None else str(self.low)
+        high = "inf" if self.high is None else str(self.high)
+        return f"[{low}, {high}]"
+
+
+@dataclass(frozen=True)
 class StateSpec:
     """Formal description of one state tensor in a neuron's step.
 
@@ -91,6 +153,11 @@ class StateSpec:
     disables shape validation (hidden allocation then mirrors the input).
     ``differentiable`` marks whether the state participates in autograd
     (spike tensors are typically not).
+
+    ``value_range`` declares an inclusive ``(lo, hi)`` bound for the state
+    (see ``ValueRange``). ``soft_range=True`` marks the bound as soft: values
+    may exceed it and the module never acts on them. Prefer the ``range``
+    field (a ``RangeSpec``) for full control over clamping and diagnostics.
     """
 
     name: str
@@ -98,6 +165,19 @@ class StateSpec:
     dtype: Optional[torch.dtype] = None
     shape: Literal["input"] | tuple[int, ...] | None = "input"
     differentiable: bool = True
+    value_range: Optional[ValueRange] = None
+    soft_range: bool = False
+
+    #: Preferred range declaration. If set, this wins over the legacy
+    #: ``value_range`` / ``soft_range`` fields.
+    range: Optional[RangeSpec] = None
+
+    #: Optional sugar for constructing a RangeSpec from legacy tuple ranges.
+    #: These are ignored when ``range`` is provided.
+    range_clamp: Optional[bool] = None
+    range_warn: Optional[bool] = None
+    range_error: Optional[bool] = None
+    range_tol: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +196,7 @@ class SequenceOutput:
 
 def subtract_reset(mem: Tensor, spk: Tensor, threshold: Tensor) -> Tensor:
     """Reset by subtracting the threshold from fired neurons."""
-    return mem - spk * threshold
+    return torch.addcmul(mem, spk, threshold, value=-1.0)
 
 
 def zero_reset(mem: Tensor, spk: Tensor, threshold: Tensor) -> Tensor:
@@ -147,6 +227,58 @@ def clamp_unit_interval(t: Tensor) -> Tensor:
 def clamp_positive(t: Tensor) -> Tensor:
     """Clamp to stay strictly positive (e.g. thresholds, QIF/AdEx beta)."""
     return torch.clamp(t, min=1e-6)
+
+
+def _clamp_low_high(t: Tensor, low: float, high: float) -> Tensor:
+    return torch.clamp(t, low, high)
+
+
+def _clamp_low(t: Tensor, low: float) -> Tensor:
+    return torch.clamp_min(t, low)
+
+
+def _clamp_high(t: Tensor, high: float) -> Tensor:
+    return torch.clamp_max(t, high)
+
+
+def _make_range_clamp(rng: Optional[RangeSpec]) -> TensorConstraint:
+    """Build a picklable clamp constraint from a RangeSpec.
+
+    Clamps are built from module-level helpers and ``functools.partial`` so
+    they survive serialization (no closures stored on the module).
+    """
+    if rng is None or not rng.clamp:
+        return identity
+
+    low = rng.low
+    high = rng.high
+
+    if low is None and high is None:
+        return identity
+
+    if low is None:
+        assert high is not None
+        return partial(_clamp_high, high=high)
+
+    if high is None:
+        assert low is not None
+        return partial(_clamp_low, low=low)
+
+    return partial(_clamp_low_high, low=low, high=high)
+
+
+def _constrain_if_learnable(
+    value: Tensor, constraint: TensorConstraint
+) -> Tensor:
+    """Apply ``constraint`` only while ``value`` is a learnable parameter.
+
+    Fixed (non-learnable) values are returned unchanged: the caller chose them
+    directly, so re-clamping a constant every step is dead work and would
+    silently override an intentionally set value.
+    """
+    if value.requires_grad:
+        return constraint(value)
+    return value
 
 
 def _floating_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -221,10 +353,22 @@ class SpikingModule(nn.Module):
     _step: StepFn
 
     _cached_state_specs: Optional[tuple[StateSpec, ...]] = None
+    _cached_state_specs_no_spk: Optional[tuple[StateSpec, ...]] = None
     _cached_state_names: Optional[tuple[str, ...]] = None
     _cached_reset_values: Optional[tuple[float, ...]] = None
     _cached_n_state: Optional[int] = None
     _cached_n_explicit_state: Optional[int] = None
+    _cached_state_clamps: Optional[tuple[TensorConstraint, ...]] = None
+    _cached_state_ranges: Optional[tuple[Optional[RangeSpec], ...]] = None
+
+    #: Selected range enforcer. Usually a bound method selected at metadata
+    #: time. Kept as a callable so the hot path can call it directly.
+    _range_enforcer: Optional[
+        Callable[[tuple[Tensor, ...]], tuple[Tensor, ...]]
+    ] = None
+
+    #: Debug-only entries used when validate=True.
+    _range_debug_entries: tuple[tuple[int, str, RangeSpec], ...] = ()
 
     #
     # Construction / public forward interface
@@ -243,6 +387,7 @@ class SpikingModule(nn.Module):
         self._validate_override = validate
         self.use_fused_sequence = use_fused_sequence
         self._fused_forward_sequence: Optional[FusedSequenceFn] = None
+        self._range_warn_counts: dict[str, int] = {}
         if use_fused_sequence:
             # Reference implementation: the per-step scan is the shipped
             # default consumer of the hook until a kernel package overrides
@@ -324,6 +469,135 @@ class SpikingModule(nn.Module):
         assert self._cached_reset_values is not None
         return self._cached_reset_values
 
+    def _resolve_range_spec(self, spec: StateSpec) -> Optional[RangeSpec]:
+        """Resolve a StateSpec into an effective RangeSpec.
+
+        Precedence:
+            1. explicit ``spec.range``
+            2. legacy ``value_range`` plus optional range_* sugar fields
+            3. no range
+        """
+        if spec.range is not None:
+            return spec.range
+
+        if spec.value_range is None:
+            return None
+
+        low, high = spec.value_range
+        if low is None and high is None:
+            return None
+
+        if spec.soft_range:
+            return RangeSpec(
+                low=low,
+                high=high,
+                clamp=False,
+                warn=False,
+                error=False,
+            )
+
+        return RangeSpec(
+            low=low,
+            high=high,
+            clamp=True if spec.range_clamp is None else spec.range_clamp,
+            warn=False if spec.range_warn is None else spec.range_warn,
+            error=False if spec.range_error is None else spec.range_error,
+            tol=1e-6 if spec.range_tol is None else spec.range_tol,
+        )
+
+    def _build_range_debug_entries(
+        self,
+        specs: tuple[StateSpec, ...],
+        ranges: tuple[Optional[RangeSpec], ...],
+    ) -> tuple[tuple[int, str, RangeSpec], ...]:
+        active: list[tuple[int, str, RangeSpec]] = []
+
+        for i, (spec, rng) in enumerate(zip(specs, ranges)):
+            if rng is None:
+                continue
+
+            if rng.warn or rng.error:
+                active.append((i, spec.name, rng))
+
+        return tuple(active)
+
+    def _check_reset_values_against_ranges(
+        self,
+        specs: tuple[StateSpec, ...],
+        ranges: tuple[Optional[RangeSpec], ...],
+    ) -> None:
+        for spec, rng in zip(specs, ranges):
+            if rng is None:
+                continue
+
+            value = spec.reset_value
+
+            if rng.low is not None and value < rng.low - rng.tol:
+                msg = (
+                    f"{self.neuron_name} state '{spec.name}' reset_value "
+                    f"{value} is below range lower bound {rng.low}"
+                )
+
+                if rng.error:
+                    raise ValueError(msg)
+
+                if rng.warn:
+                    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+
+            if rng.high is not None and value > rng.high + rng.tol:
+                msg = (
+                    f"{self.neuron_name} state '{spec.name}' reset_value "
+                    f"{value} is above range upper bound {rng.high}"
+                )
+
+                if rng.error:
+                    raise ValueError(msg)
+
+                if rng.warn:
+                    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+
+    def _run_range_debug(self, out: tuple[Tensor, ...]) -> None:
+        """Debug-only range diagnostics.
+
+        This must never run in benchmark/compiled fast paths.
+        """
+        for i, name, rng in self._range_debug_entries:
+            t = out[i]
+
+            if not rng.violates(t):
+                continue
+
+            msg = (
+                f"{self.neuron_name} state '{name}' violated range "
+                f"{rng.describe()}"
+            )
+
+            if rng.error:
+                raise ValueError(msg)
+
+            if rng.warn:
+                self._warn_range_violation(name, rng)
+
+    def _warn_range_violation(self, name: str, rng: RangeSpec) -> None:
+        count = self._range_warn_counts.get(name, 0)
+
+        if count == 0:
+            warnings.warn(
+                f"{self.neuron_name} state '{name}' violated range "
+                f"{rng.describe()}; clamping into range.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        elif count == 10:
+            warnings.warn(
+                f"{self.neuron_name} state '{name}' has repeatedly violated "
+                f"range {rng.describe()}; suppressing further warnings.",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+
+        self._range_warn_counts[name] = count + 1
+
     #
     # State metadata
     #
@@ -341,10 +615,24 @@ class SpikingModule(nn.Module):
         specs = self._get_state_specs()
         self._check_state_specs(specs)
         self._cached_state_specs = specs
+        self._cached_state_specs_no_spk = specs[1:]
         self._cached_state_names = tuple(spec.name for spec in specs)
         self._cached_reset_values = tuple(spec.reset_value for spec in specs)
         self._cached_n_state = len(specs)
         self._cached_n_explicit_state = len(specs) - 1
+
+        ranges = tuple(self._resolve_range_spec(spec) for spec in specs)
+        self._cached_state_ranges = ranges
+
+        self._cached_state_clamps = tuple(
+            _make_range_clamp(rng) for rng in ranges
+        )
+
+        self._range_enforcer = self._select_range_enforcer(
+            self._cached_state_clamps
+        )
+        self._range_debug_entries = self._build_range_debug_entries(specs, ranges)
+        self._check_reset_values_against_ranges(specs, ranges)
 
     @property
     def _state_specs(self) -> tuple[StateSpec, ...]:
@@ -366,6 +654,20 @@ class SpikingModule(nn.Module):
         self._ensure_state_metadata()
         assert self._cached_reset_values is not None
         return self._cached_reset_values
+
+    @property
+    def _state_clamps(self) -> tuple[TensorConstraint, ...]:
+        """Per-state clamps resolved once at metadata construction."""
+        self._ensure_state_metadata()
+        assert self._cached_state_clamps is not None
+        return self._cached_state_clamps
+
+    @property
+    def _state_ranges(self) -> tuple[Optional[RangeSpec], ...]:
+        """Per-state resolved ranges, ``spk`` first."""
+        self._ensure_state_metadata()
+        assert self._cached_state_ranges is not None
+        return self._cached_state_ranges
 
     @property
     def _n_state(self) -> int:
@@ -393,9 +695,74 @@ class SpikingModule(nn.Module):
                     f"{type(t).__name__}, expected Tensor"
                 )
 
+    def _select_range_enforcer(
+        self,
+        clamps: tuple[TensorConstraint, ...],
+    ) -> Optional[Callable[[tuple[Tensor, ...]], tuple[Tensor, ...]]]:
+        """Select a specialized range enforcer at metadata time.
+
+        The returned object is a bound method, not a lambda, so modules stay
+        easier to serialize than if we stored closures directly.
+        """
+        if all(clamp is identity for clamp in clamps):
+            return None
+
+        n = len(clamps)
+
+        if n == 2:
+            c0_identity = clamps[0] is identity
+            c1_identity = clamps[1] is identity
+
+            if c0_identity and not c1_identity:
+                return self._apply_ranges_2_keep0_clamp1
+
+            if not c0_identity and c1_identity:
+                return self._apply_ranges_2_clamp0_keep1
+
+            if not c0_identity and not c1_identity:
+                return self._apply_ranges_2_clamp0_clamp1
+
+        return self._apply_ranges_generic
+
+    def _apply_ranges_2_keep0_clamp1(
+        self,
+        out: tuple[Tensor, ...],
+    ) -> tuple[Tensor, ...]:
+        assert self._cached_state_clamps is not None
+        return (out[0], self._cached_state_clamps[1](out[1]))
+
+    def _apply_ranges_2_clamp0_keep1(
+        self,
+        out: tuple[Tensor, ...],
+    ) -> tuple[Tensor, ...]:
+        assert self._cached_state_clamps is not None
+        return (self._cached_state_clamps[0](out[0]), out[1])
+
+    def _apply_ranges_2_clamp0_clamp1(
+        self,
+        out: tuple[Tensor, ...],
+    ) -> tuple[Tensor, ...]:
+        assert self._cached_state_clamps is not None
+        return (
+            self._cached_state_clamps[0](out[0]),
+            self._cached_state_clamps[1](out[1]),
+        )
+
+    def _apply_ranges_generic(
+        self,
+        out: tuple[Tensor, ...],
+    ) -> tuple[Tensor, ...]:
+        assert self._cached_state_clamps is not None
+        return tuple(
+            clamp(t) for clamp, t in zip(self._cached_state_clamps, out)
+        )
+
     def _step_forward(self, x: Tensor) -> tuple[Tensor, ...]:
         """Feed the current buffers into the pure ``_step`` and return its output."""
-        state = tuple(getattr(self, spec.name) for spec in self._state_specs_no_spk)
+        # Read directly from _buffers: nn.Module.__getattr__ would add a Python
+        # dispatch hop per state per step.
+        buffers = self._buffers
+        state = tuple(buffers[spec.name] for spec in self._state_specs_no_spk)
         return self._step(x, *state)
 
     @property
@@ -464,13 +831,38 @@ class SpikingModule(nn.Module):
             self._alloc_state(x)
 
     def _store_hidden_outputs(self, out: tuple[Tensor, ...]) -> None:
+        buffers = self._buffers
         for spec, t in zip(self._state_specs, out):
             if not spec.differentiable:
                 t = t.detach()
-            # Buffers were registered by _alloc_state before the step; a
-            # plain attribute assignment replaces the _buffers entry without
-            # register_buffer's per-step bookkeeping.
-            setattr(self, spec.name, t)
+            # Buffers were registered by _alloc_state before the step, so the
+            # names are already in self._buffers. Write the entry directly:
+            # nn.Module.__setattr__ would route the assignment through
+            # register_buffer() every step (module.py), which is pure per-step
+            # Python overhead and re-runs the registration hooks. Attribute
+            # reads already resolve through nn.Module.__getattr__ -> self._buffers,
+            # so a plain dict write is fully equivalent.
+            buffers[spec.name] = t
+
+    def _hidden_step(self, x: Tensor) -> Tensor:
+        """Run one hidden step assuming buffers are already allocated.
+
+        Shared by ``_forward_hidden`` and the hidden sequence scan, which
+        hoists ``_prepare_hidden`` out of the per-step loop.
+        """
+        out = self._step_forward(x)
+
+        if self.validate:
+            self._check_step_output(out, self._n_state)
+
+            if self._range_debug_entries:
+                self._run_range_debug(out)
+
+        if self._range_enforcer is not None:
+            out = self._range_enforcer(out)
+
+        self._store_hidden_outputs(out)
+        return out[0]
 
     def _forward_hidden(self, x: Tensor, *state: Tensor) -> Tensor:
         if state:
@@ -478,11 +870,7 @@ class SpikingModule(nn.Module):
                 f"{self.neuron_name} hidden forward takes no state, got {len(state)}"
             )
         self._prepare_hidden(x)
-        out = self._step_forward(x)
-        if self.validate:
-            self._check_step_output(out, self._n_state)
-        self._store_hidden_outputs(out)
-        return out[0]
+        return self._hidden_step(x)
 
     #
     # Explicit-mode helpers
@@ -507,13 +895,22 @@ class SpikingModule(nn.Module):
         return state
 
     def _forward_explicit(self, x: Tensor, *state: Tensor) -> tuple[Tensor, ...]:
+        self._ensure_state_metadata()
+
         if self.validate:
-            self._ensure_state_metadata()
             self._check_explicit(x, *state)
             self._check_state_shapes(x, *state)
         out = self._step(x, *state)
+
         if self.validate:
             self._check_step_output(out, self._n_state)
+
+            if self._range_debug_entries:
+                self._run_range_debug(out)
+
+        if self._range_enforcer is not None:
+            out = self._range_enforcer(out)
+
         return out
 
     #
@@ -577,7 +974,11 @@ class SpikingModule(nn.Module):
                     stacklevel=2,
                 )
                 self._warned_hidden_sequence_train = True
-        return torch.stack([self._forward_hidden(x_t) for x_t in x_seq])
+        # Allocate/validate once up front instead of re-running _needs_alloc
+        # every step: every row of x_seq shares one shape, so the per-step
+        # check is constant work.
+        self._prepare_hidden(x_seq[0])
+        return torch.stack([self._hidden_step(x_t) for x_t in x_seq])
 
     def _reference_explicit_sequence_scan(
         self,
@@ -606,9 +1007,20 @@ class SpikingModule(nn.Module):
         (CUDA graphs) is safe across repeated calls: without the clone, a
         subsequent graph run overwrites the previously returned tensor.
         """
+        self._ensure_state_metadata()
+
         compiled = torch.compile(self._reference_sequence_scan, **kwargs)
 
         def _fused(x_seq: Tensor, state: Optional[tuple[Tensor, ...]] = None):
+            if self.init_hidden and x_seq.shape[0] > 0:
+                # Allocate the hidden buffers *before* the first compiled call.
+                # If the initial trace runs _alloc_state, the buffer metadata
+                # reads (e.g. QIF's float(self.v_rest.detach())) force a
+                # ``Tensor.item()`` graph break and the scan silently falls
+                # back to per-step eager execution. Pre-allocating keeps the
+                # traced ``_needs_alloc`` path constant-False so the scan
+                # fuses into a single graph.
+                self._prepare_hidden(x_seq[0])
             out = compiled(x_seq, state)
             if isinstance(out, Tensor):
                 return out.clone()
@@ -888,7 +1300,9 @@ class SpikingModule(nn.Module):
     @property
     def _state_specs_no_spk(self) -> tuple[StateSpec, ...]:
         """State specs for the explicit-state tuple (everything but ``spk``)."""
-        return self._state_specs[1:]
+        self._ensure_state_metadata()
+        assert self._cached_state_specs_no_spk is not None
+        return self._cached_state_specs_no_spk
 
     def zero_state(
         self,

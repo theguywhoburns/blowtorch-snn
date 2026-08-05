@@ -10,6 +10,7 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
+    _constrain_if_learnable,
     identity,
 )
 from ..surrogate import SpikeGrad, default_spike_grad
@@ -251,7 +252,9 @@ class Izhikevich(SpikingModule):
         return mem, u
 
     def _step(self, x: Tensor, mem: Tensor, u: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        threshold = self.threshold_constraint(self.threshold)
+        threshold = _constrain_if_learnable(
+            self.threshold, self.threshold_constraint
+        )
 
         if self.spike_detection == "post":
             mem, u = self._integrate(x, mem, u)

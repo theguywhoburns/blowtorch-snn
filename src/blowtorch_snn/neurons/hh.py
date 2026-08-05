@@ -8,6 +8,7 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
+    _constrain_if_learnable,
     identity,
 )
 from ..surrogate import SpikeGrad, default_spike_grad
@@ -20,10 +21,15 @@ def _hh_rate(x: Tensor, a: float, c: float) -> Tensor:
     denominator is replaced by 1 inside the mask so *both* ``torch.where``
     branches stay numerically safe in the backward pass (an unsafe
     unselected branch can leak ``0 * inf = NaN`` into gradients).
+
+    The ``where`` constants are broadcast scalars rather than
+    ``ones_like``/``full_like``: the masked ``d`` already yields the ``a * c``
+    limit (never ``0/0``), so allocating full tensors for the constant branch
+    is wasted work on the hot path.
     """
     mask = x.abs() < 1e-4
-    d = torch.where(mask, torch.ones_like(x), 1.0 - torch.exp(-x / c))
-    return torch.where(mask, torch.full_like(x, a * c), a * x / d)
+    d = torch.where(mask, 1.0, 1.0 - torch.exp(-x / c))
+    return torch.where(mask, a * c, a * x / d)
 
 
 class HH(SpikingModule):
@@ -133,7 +139,9 @@ class HH(SpikingModule):
     def _step(
         self, x: Tensor, mem: Tensor, m: Tensor, h: Tensor, n: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        threshold = self.threshold_constraint(self.threshold)
+        threshold = _constrain_if_learnable(
+            self.threshold, self.threshold_constraint
+        )
         dt = self.dt / self.substeps
         for _ in range(self.substeps):
             gNa = self.gNa * (m ** 3) * h

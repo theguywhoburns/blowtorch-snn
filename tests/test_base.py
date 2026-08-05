@@ -50,6 +50,49 @@ class _WrongArityExplicit(SpikingModule):
         return torch.zeros_like(x), torch.zeros_like(x)
 
 
+class _Ranged(SpikingModule):
+    neuron_name = "_Ranged"
+
+    mem: torch.Tensor
+
+    def __init__(
+        self,
+        *,
+        init_hidden: bool,
+        mem_range,
+        soft: bool = False,
+        validate: Optional[bool] = None,
+        error: bool = False,
+        warn: bool = False,
+    ):
+        super().__init__(size=None, init_hidden=init_hidden, validate=validate)
+        self._mem_range = mem_range
+        self._soft = soft
+        self._error = error
+        self._warn = warn
+
+    def _get_state_specs(self) -> tuple[StateSpec, ...]:
+        return (
+            StateSpec("spk", 0.0),
+            StateSpec(
+                "mem",
+                0.0,
+                value_range=self._mem_range,
+                soft_range=self._soft,
+                range_error=self._error,
+                range_warn=self._warn,
+            ),
+        )
+
+    def _step(self, x, mem):
+        mem_new = mem + x
+        spk = (mem_new > 0.5).float()
+        return spk, mem_new
+
+    def _step_forward(self, x):
+        return self._step(x, self.mem)
+
+
 
 @pytest.mark.parametrize("cls,kwargs", NEURONS)
 def test_step_forward_arity_matches_spec(cls, kwargs):
@@ -489,6 +532,77 @@ def test_set_validation_global_toggle(monkeypatch):
         assert n.validate is True
     finally:
         set_validation(original)
+
+
+@pytest.mark.parametrize("init_hidden", [True, False])
+def test_value_range_hard_clamps_when_validate_off(init_hidden):
+    n = _Ranged(init_hidden=init_hidden, mem_range=(-2.0, 2.0), validate=False)
+    x = torch.full((B, F), 5.0)
+    if init_hidden:
+        spk = n(x)
+        mem = n.mem
+    else:
+        with torch.no_grad():
+            spk, mem = _explicit_step(n, x)
+    assert torch.equal(mem, torch.full((B, F), 2.0))
+    assert spk.shape == X.shape
+
+
+def test_value_range_error_raises_when_validate_on():
+    n = _Ranged(
+        init_hidden=True, mem_range=(-2.0, 2.0), validate=True, error=True
+    )
+    with pytest.raises(ValueError, match="violated range"):
+        n(torch.full((B, F), 5.0))
+
+
+def test_value_range_soft_never_enforces():
+    n = _Ranged(init_hidden=True, mem_range=(-2.0, 2.0), soft=True, validate=False)
+    n(torch.full((B, F), 5.0))
+    assert torch.equal(n.mem, torch.full((B, F), 5.0))
+    n(torch.full((B, F), -7.0))
+    assert torch.equal(n.mem, torch.full((B, F), -2.0))
+
+
+def test_value_range_none_is_identity():
+    n = _Ranged(init_hidden=True, mem_range=None, validate=False)
+    n(torch.full((B, F), 5.0))
+    assert torch.equal(n.mem, torch.full((B, F), 5.0))
+
+
+def test_value_range_none_none_is_identity():
+    n = _Ranged(init_hidden=True, mem_range=(None, None), validate=False)
+    n(torch.full((B, F), 5.0))
+    assert torch.equal(n.mem, torch.full((B, F), 5.0))
+
+
+def test_value_range_half_bounds_validate_off():
+    n = _Ranged(init_hidden=True, mem_range=(None, 3.0), validate=False)
+    n(torch.full((B, F), 9.0))
+    assert torch.equal(n.mem, torch.full((B, F), 3.0))
+    n = _Ranged(init_hidden=True, mem_range=(-1.0, None), validate=False)
+    n(torch.full((B, F), -5.0))
+    assert torch.equal(n.mem, torch.full((B, F), -1.0))
+
+
+def test_value_range_clamp_is_statically_resolved():
+    n = _Ranged(init_hidden=True, mem_range=(-2.0, 2.0), validate=False)
+    from blowtorch_snn.base import identity
+
+    assert n._state_clamps[0] is identity
+    assert n._state_clamps[1] is not identity
+
+
+def test_value_range_soft_does_not_raise_even_with_validate_on():
+    n = _Ranged(init_hidden=True, mem_range=(-2.0, 2.0), soft=True, validate=True)
+    n(torch.full((B, F), 5.0))
+    assert torch.equal(n.mem, torch.full((B, F), 5.0))
+
+
+def _explicit_step(n, x):
+    state = n.initial_state((B, F))
+    out = n(x, *state)
+    return out[0], out[1]
 
 
 @pytest.mark.parametrize("cls,kwargs", NEURONS)
