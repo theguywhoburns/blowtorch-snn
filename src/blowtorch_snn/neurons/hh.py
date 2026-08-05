@@ -8,7 +8,6 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
-    _constrain_if_learnable,
     identity,
 )
 from ..surrogate import SpikeGrad, default_spike_grad
@@ -63,6 +62,8 @@ class HH(SpikingModule):
     m: Tensor
     h: Tensor
     n: Tensor
+
+    _constrained_param_specs = {"threshold": "threshold_constraint"}
 
     def __init__(
         self,
@@ -139,9 +140,7 @@ class HH(SpikingModule):
     def _step(
         self, x: Tensor, mem: Tensor, m: Tensor, h: Tensor, n: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        threshold = _constrain_if_learnable(
-            self.threshold, self.threshold_constraint
-        )
+        (threshold,) = self._constrained_params()
         dt = self.dt / self.substeps
         for _ in range(self.substeps):
             gNa = self.gNa * (m ** 3) * h

@@ -9,7 +9,6 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
-    _constrain_if_learnable,
     clamp_unit_interval,
     clamp_positive,
     subtract_reset,
@@ -31,6 +30,11 @@ class SRM(SpikingModule):
 
     mem: Tensor
     ref: Tensor
+
+    _constrained_param_specs = {
+        "beta": "beta_constraint",
+        "threshold": "threshold_constraint",
+    }
 
     def __init__(
         self,
@@ -64,10 +68,7 @@ class SRM(SpikingModule):
         )
 
     def _step(self, x: Tensor, mem: Tensor, ref: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        beta = _constrain_if_learnable(self.beta, self.beta_constraint)
-        threshold = _constrain_if_learnable(
-            self.threshold, self.threshold_constraint
-        )
+        beta, threshold = self._constrained_params()
         ref = torch.clamp(ref - 1.0, min=0.0)
         mem = beta * mem + x
         spk = self.spike_grad(mem - threshold) * (ref <= 1e-6).to(mem.dtype)

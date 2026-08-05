@@ -11,7 +11,6 @@ from ..base import (
     TensorConstraint,
     clamp_unit_interval,
     clamp_positive,
-    identity,
     subtract_reset,
 )
 from ..surrogate import SpikeGrad, default_spike_grad
@@ -29,6 +28,11 @@ class LIF(SpikingModule):
     neuron_name = "LIF"
     mem: Tensor
 
+    _constrained_param_specs = {
+        "beta": "beta_constraint",
+        "threshold": "threshold_constraint",
+    }
+
     def __init__(
         self,
         beta: float,
@@ -42,32 +46,12 @@ class LIF(SpikingModule):
         **kwargs: Unpack[SpikingModuleKwargs],
     ):
         super().__init__(**kwargs)
-
-        # Keep original constraints around for introspection.
+        self.beta = nn.Parameter(torch.tensor(beta), requires_grad=learnable_beta)
+        self.threshold = nn.Parameter(
+            torch.tensor(threshold), requires_grad=learnable_threshold
+        )
         self.beta_constraint = beta_constraint
         self.threshold_constraint = threshold_constraint
-
-        beta_t = torch.as_tensor(beta, dtype=torch.get_default_dtype())
-        threshold_t = torch.as_tensor(threshold, dtype=torch.get_default_dtype())
-
-        if learnable_beta:
-            self.beta = nn.Parameter(beta_t)
-            self._beta_constraint = beta_constraint
-        else:
-            # Apply the constraint once. Fixed parameters should not pay
-            # constraint overhead on every step.
-            self.register_buffer("beta", beta_constraint(beta_t))
-            self._beta_constraint = identity
-
-        if learnable_threshold:
-            self.threshold = nn.Parameter(threshold_t)
-            self._threshold_constraint = threshold_constraint
-        else:
-            # Apply the constraint once. Fixed parameters should not pay
-            # constraint overhead on every step.
-            self.register_buffer("threshold", threshold_constraint(threshold_t))
-            self._threshold_constraint = identity
-
         self.spike_grad = spike_grad
         self.reset_mechanism = reset_mechanism
 
@@ -75,12 +59,6 @@ class LIF(SpikingModule):
         return (
             StateSpec("spk", 0.0, differentiable=False),
             StateSpec("mem", 0.0),
-        )
-
-    def _constrained_params(self) -> tuple[Tensor, Tensor]:
-        return (
-            self._beta_constraint(self.beta),
-            self._threshold_constraint(self.threshold),
         )
 
     def _step(self, x: Tensor, mem: Tensor) -> tuple[Tensor, Tensor]:

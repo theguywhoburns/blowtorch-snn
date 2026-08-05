@@ -267,20 +267,6 @@ def _make_range_clamp(rng: Optional[RangeSpec]) -> TensorConstraint:
     return partial(_clamp_low_high, low=low, high=high)
 
 
-def _constrain_if_learnable(
-    value: Tensor, constraint: TensorConstraint
-) -> Tensor:
-    """Apply ``constraint`` only while ``value`` is a learnable parameter.
-
-    Fixed (non-learnable) values are returned unchanged: the caller chose them
-    directly, so re-clamping a constant every step is dead work and would
-    silently override an intentionally set value.
-    """
-    if value.requires_grad:
-        return constraint(value)
-    return value
-
-
 def _floating_dtype(dtype: torch.dtype) -> torch.dtype:
     """Return a floating dtype.
 
@@ -369,6 +355,12 @@ class SpikingModule(nn.Module):
 
     #: Debug-only entries used when validate=True.
     _range_debug_entries: tuple[tuple[int, str, RangeSpec], ...] = ()
+
+    #: Declares which learnable parameters carry a runtime constraint,
+    #: mapping the parameter attribute name to the attribute name holding the
+    #: user-supplied constraint callable. Subclasses override this; the base
+    #: resolves it once (cached) into per-parameter effective constraints.
+    _constrained_param_specs: dict[str, str] = {}
 
     #
     # Construction / public forward interface
@@ -468,6 +460,47 @@ class SpikingModule(nn.Module):
         self._ensure_state_metadata()
         assert self._cached_reset_values is not None
         return self._cached_reset_values
+
+    def _resolved_constraints(self) -> dict[str, TensorConstraint]:
+        """Resolve, once and cached, each constrained parameter's constraint.
+
+        For every parameter declared in ``_constrained_param_specs``, pick the
+        effective runtime constraint: the user's ``clamp``-style callable when
+        the parameter ``requires_grad`` (so training stays in range) or
+        ``identity`` when the parameter is fixed (the constraint would be dead
+        work and could silently override an intentionally set value).
+
+        ``requires_grad`` is fixed at parameter creation and never changes, so
+        this decision is safe to cache forever. The cache is stored in
+        ``self.__dict__`` directly (under a key distinct from the method name)
+        because ``nn.Module.__setattr__`` would otherwise register the stored
+        callables (they are not parameters).
+        """
+        resolved = self.__dict__.get("_resolved_constraint_map")
+        if resolved is None:
+            resolved = {}
+            for param_name, constraint_attr in type(self)._constrained_param_specs.items():
+                value = getattr(self, param_name)
+                constraint = getattr(self, constraint_attr)
+                resolved[param_name] = constraint if value.requires_grad else identity
+            self.__dict__["_resolved_constraint_map"] = resolved
+        return resolved
+
+    def _constrained_params(self, *names: str) -> tuple[Tensor, ...]:
+        """Apply each named parameter's effective constraint.
+
+        ``names`` defaults to the neuron's declared constrained parameters in
+        declaration order; pass explicit names to fetch a subset (QIF/AdEx/SRM
+        constrain both ``beta`` and ``threshold``, Izhikevich/HH only
+        ``threshold``). Fixed parameters are returned unchanged (``identity``),
+        learnable ones are clamped. The learnable-vs-fixed selection is cached
+        by ``_resolved_constraints``, so this runs no per-parameter branching.
+        """
+        resolved = self._resolved_constraints()
+        if names:
+            return tuple(resolved[name](getattr(self, name)) for name in names)
+        decl = type(self)._constrained_param_specs
+        return tuple(resolved[name](getattr(self, name)) for name in decl)
 
     def _resolve_range_spec(self, spec: StateSpec) -> Optional[RangeSpec]:
         """Resolve a StateSpec into an effective RangeSpec.

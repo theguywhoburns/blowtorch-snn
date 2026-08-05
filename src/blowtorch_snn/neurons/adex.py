@@ -8,7 +8,6 @@ from ..base import (
     StateSpec,
     Tensor,
     TensorConstraint,
-    _constrain_if_learnable,
     clamp_positive,
     identity,
 )
@@ -30,6 +29,11 @@ class AdEx(SpikingModule):
 
     mem: Tensor
     w: Tensor
+
+    _constrained_param_specs = {
+        "beta": "beta_constraint",
+        "threshold": "threshold_constraint",
+    }
 
     def __init__(
         self,
@@ -73,10 +77,7 @@ class AdEx(SpikingModule):
         )
 
     def _step(self, x: Tensor, mem: Tensor, w: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        beta = _constrain_if_learnable(self.beta, self.beta_constraint)
-        threshold = _constrain_if_learnable(
-            self.threshold, self.threshold_constraint
-        )
+        beta, threshold = self._constrained_params()
         exponent = torch.clamp((mem - self.v_thresh) / self.delta_T, max=20.0)
         exp_term = self.delta_T * torch.exp(exponent)
         mem = mem + beta * (-(mem - self.v_rest) + exp_term - w + x)

@@ -241,13 +241,12 @@ def test_constraints_apply_per_neuron():
 def test_constraint_skipped_for_fixed_params():
     lif = LIF(beta=2.0, init_hidden=True)
     beta, threshold = lif._constrained_params()
-    # Constrained once at init into a non-trainable buffer...
-    assert isinstance(lif.beta, torch.Tensor)
-    assert not isinstance(lif.beta, torch.nn.Parameter)
-    assert beta.item() == 1.0  # clamp_unit_interval applied once at init
+    # Fixed params are plain, non-trainable Parameters.
+    assert isinstance(lif.beta, torch.nn.Parameter)
+    assert not lif.beta.requires_grad
+    # Constraint is skipped for non-learnable values: beta stays out of range.
+    assert beta.item() == 2.0
     assert threshold.item() == 1.0
-    # ...and returned unchanged at runtime (identity constraint).
-    assert beta is lif.beta
 
 
 def test_constraint_applied_for_learnable_params():
