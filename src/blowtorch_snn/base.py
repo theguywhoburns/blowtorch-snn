@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import warnings
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional, TypedDict, Unpack
 
@@ -63,9 +63,8 @@ class SpikingModuleKwargs(TypedDict, total=False):
     ``SpikingModule``.
 
     ``size`` declares the feature dimension (feature-last), ``init_hidden``
-    picks the state-tracking (hidden) vs. explicit path, ``preallocated``
-    enables the inference-only in-place buffer path (requires
-    ``init_hidden=True``), ``validate`` overrides the global validation
+    picks the state-tracking (hidden) vs. explicit path, ``validate`` overrides
+    the global validation
     toggle per instance, and ``use_fused_sequence`` routes
     ``forward_sequence`` through ``_fused_forward_sequence`` (falling back to
     the reference per-step scan). All are optional and keyword-only on the
@@ -75,7 +74,6 @@ class SpikingModuleKwargs(TypedDict, total=False):
 
     size: Optional[int]
     init_hidden: bool
-    preallocated: bool
     validate: Optional[bool]
     use_fused_sequence: bool
 
@@ -174,8 +172,7 @@ class SpikingModule(nn.Module):
     state lives in non-persistent buffers so it
     follows ``.to()``/``.float()``/``.half()`` like normal PyTorch state, and
     is regenerated with a fresh buffer tensor each step so gradient flow
-    through time is preserved. Set ``preallocated=True`` to reuse buffers in
-    place instead (inference only, no gradient through time). State is never
+    through time is preserved. State is never
     silently reallocated to a new geometry -- a shape, device, or dtype change
     raises.
 
@@ -208,7 +205,7 @@ class SpikingModule(nn.Module):
     pass ``validate=False`` to skip the checks in hot inference loops.
 
     Every neuron constructor forwards the shared ``size``, ``init_hidden``,
-    ``preallocated``, ``validate``, and ``use_fused_sequence`` options here as
+    ``validate``, and ``use_fused_sequence`` options here as
     keyword-only arguments (see ``SpikingModuleKwargs``); they take their
     semantics from this docstring rather than being re-declared on each
     neuron.
@@ -237,18 +234,12 @@ class SpikingModule(nn.Module):
         self,
         size: Optional[int] = None,
         init_hidden: bool = False,
-        preallocated: bool = False,
         validate: Optional[bool] = None,
         use_fused_sequence: bool = False,
     ):
         super().__init__()
-        if preallocated and not init_hidden:
-            raise ValueError(
-                f"{self.neuron_name} preallocated mode requires init_hidden=True"
-            )
         self.size = size
         self.init_hidden = init_hidden
-        self.preallocated = preallocated
         self._validate_override = validate
         self.use_fused_sequence = use_fused_sequence
         self._fused_forward_sequence: Optional[FusedSequenceFn] = None
@@ -272,8 +263,6 @@ class SpikingModule(nn.Module):
         subclassing, export, and tooling.
         """
         if self.init_hidden:
-            if self.preallocated:
-                return self._forward_hidden_prealloc(x, *state)
             return self._forward_hidden(x, *state)
         return self._forward_explicit(x, *state)
 
@@ -296,8 +285,6 @@ class SpikingModule(nn.Module):
         if self.size is not None:
             parts.append(f"size={self.size}")
         parts.append(f"init_hidden={self.init_hidden}")
-        if self.init_hidden:
-            parts.append(f"preallocated={self.preallocated}")
         if self.use_fused_sequence:
             parts.append("use_fused_sequence=True")
         return ", ".join(parts)
@@ -485,10 +472,6 @@ class SpikingModule(nn.Module):
             # register_buffer's per-step bookkeeping.
             setattr(self, spec.name, t)
 
-    def _copy_hidden_outputs(self, out: tuple[Tensor, ...]) -> None:
-        for name, t in zip(self._state_names, out):
-            getattr(self, name).copy_(t.detach())
-
     def _forward_hidden(self, x: Tensor, *state: Tensor) -> Tensor:
         if state:
             raise ValueError(
@@ -532,33 +515,6 @@ class SpikingModule(nn.Module):
         if self.validate:
             self._check_step_output(out, self._n_state)
         return out
-
-    def _forward_hidden_prealloc(self, x: Tensor, *state: Tensor) -> Tensor:
-        """Inference path: allocate buffers once, then update them in place.
-
-        Unlike ``_forward_hidden`` (which re-registers a fresh buffer tensor
-        each step to preserve gradient flow through time), this writes each
-        detached step output into the existing buffer with ``copy_``, so there
-        is no per-step ``register_buffer`` bookkeeping and no autograd graph
-        kept across timesteps. This trades away differentiation through time
-        for inference throughput.
-        """
-        if self.training and torch.is_grad_enabled():
-            raise RuntimeError(
-                f"{self.neuron_name} preallocated mode is inference-only; "
-                "disable gradients or use init_hidden=False for training"
-            )
-        if state:
-            raise ValueError(
-                f"{self.neuron_name} preallocated forward takes no state, "
-                f"got {len(state)}"
-            )
-        self._prepare_hidden(x)
-        out = self._step_forward(x)
-        if self.validate:
-            self._check_step_output(out, self._n_state)
-        self._copy_hidden_outputs(out)
-        return out[0]
 
     #
     # Sequence scans
@@ -611,7 +567,7 @@ class SpikingModule(nn.Module):
         return self._reference_explicit_sequence_scan(x_seq, state)
 
     def _reference_hidden_sequence_scan(self, x_seq: Tensor) -> Tensor:
-        if torch.is_grad_enabled() and self.training and not self.preallocated:
+        if torch.is_grad_enabled() and self.training:
             if not getattr(self, "_warned_hidden_sequence_train", False):
                 warnings.warn(
                     f"{self.neuron_name} hidden-mode forward_sequence with gradients is "
@@ -621,10 +577,7 @@ class SpikingModule(nn.Module):
                     stacklevel=2,
                 )
                 self._warned_hidden_sequence_train = True
-        hidden_fwd = (
-            self._forward_hidden_prealloc if self.preallocated else self._forward_hidden
-        )
-        return torch.stack([hidden_fwd(x_t) for x_t in x_seq])
+        return torch.stack([self._forward_hidden(x_t) for x_t in x_seq])
 
     def _reference_explicit_sequence_scan(
         self,
@@ -684,32 +637,6 @@ class SpikingModule(nn.Module):
                 compile_kwargs.setdefault("mode", "reduce-overhead")
             self.compile_sequence_scan(**compile_kwargs)
         return self
-
-    def infer_sequence(self, x_seq: Tensor, *, validate: Optional[bool] = False) -> Tensor:
-        """Evolve a sequence under ``torch.inference_mode()``.
-
-        ``validate=False`` is the default for speed; pass ``validate=True`` to
-        keep per-step checks if debugging. Requires ``init_hidden=True`` and
-        ``preallocated=True`` (the inference-only rollout path); returns
-        spikes shaped ``(time, batch, features)`` without building an
-        autograd graph.
-        """
-        if not (self.init_hidden and self.preallocated):
-            raise ValueError(
-                f"{self.neuron_name} infer_sequence requires "
-                f"init_hidden=True and preallocated=True"
-            )
-        validation_ctx = no_validation() if validate is False else nullcontext()
-        with torch.inference_mode(), validation_ctx:
-            if self.use_fused_sequence and self._fused_forward_sequence is not None:
-                spikes = self.forward_sequence(x_seq)
-                assert isinstance(spikes, Tensor)
-                return spikes
-
-            self._check_sequence_input(x_seq, "infer_sequence")
-
-            hidden_fwd = self._forward_hidden_prealloc
-            return torch.stack([hidden_fwd(x_seq[t]) for t in range(x_seq.shape[0])])
 
     def forward_sequence_with_states(
         self,

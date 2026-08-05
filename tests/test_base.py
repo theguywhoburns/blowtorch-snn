@@ -430,71 +430,6 @@ def test_compile_sequence_hidden_matches_eager(cls, kwargs):
     assert torch.allclose(e, c, atol=1e-5)
 
 
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_forward_sequence_preallocated_respected(cls, kwargs):
-    prealloc = cls(init_hidden=True, preallocated=True, **kwargs)
-    with torch.no_grad():
-        spk = prealloc.forward_sequence(X_SEQ)
-    assert spk.shape == (T, B, F)
-    assert not spk.requires_grad
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_forward_sequence_preallocated_matches_standard(cls, kwargs):
-    standard = cls(init_hidden=True, **kwargs)
-    prealloc = cls(init_hidden=True, preallocated=True, **kwargs)
-    with torch.no_grad():
-        spk_s = standard.forward_sequence(X_SEQ)
-        spk_p = prealloc.forward_sequence(X_SEQ)
-    assert torch.equal(spk_s, spk_p)
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_prealloc_requires_hidden(cls, kwargs):
-    with pytest.raises(ValueError, match="requires init_hidden=True"):
-        cls(preallocated=True, **kwargs)
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_prealloc_matches_hidden_forward(cls, kwargs):
-    standard = cls(init_hidden=True, **kwargs)
-    prealloc = cls(init_hidden=True, preallocated=True, **kwargs)
-    with torch.no_grad():
-        for t in range(5):
-            spk_s = standard(X_SEQ[t])
-            spk_p = prealloc(X_SEQ[t])
-            assert torch.equal(spk_s, spk_p)
-    for spec in standard._state_specs_no_spk:
-        name = spec.name
-        assert torch.allclose(
-            getattr(prealloc, name), getattr(standard, name), atol=1e-6
-        )
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_prealloc_no_grad_through_time(cls, kwargs):
-    prealloc = cls(init_hidden=True, preallocated=True, **kwargs)
-    x = X_SEQ[0].clone().requires_grad_(True)
-    with torch.no_grad():
-        spk = prealloc(x)
-        for _ in range(3):
-            spk = prealloc(X_SEQ[0])
-    assert not spk.requires_grad
-    assert not prealloc.mem.requires_grad
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_prealloc_reset_resets_state(cls, kwargs):
-    prealloc = cls(init_hidden=True, preallocated=True, **kwargs)
-    with torch.no_grad():
-        for t in range(3):
-            prealloc(X_SEQ[t])
-    prealloc.reset()
-    for spec in prealloc._state_specs_no_spk:
-        name = spec.name
-        assert torch.all(getattr(prealloc, name) == spec.reset_value)
-
-
 def test_state_metadata_cached_once():
     n = LIF(beta=0.9)
     assert n._cached_state_specs is None
@@ -554,24 +489,6 @@ def test_set_validation_global_toggle(monkeypatch):
         assert n.validate is True
     finally:
         set_validation(original)
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_infer_sequence_requires_preallocated(cls, kwargs):
-    n = cls(init_hidden=True, **kwargs)
-    with pytest.raises(ValueError, match="init_hidden=True and preallocated=True"):
-        n.infer_sequence(X_SEQ)
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_infer_sequence_matches_forward_sequence(cls, kwargs):
-    ref = cls(init_hidden=True, preallocated=True, validate=False, **kwargs)
-    with torch.no_grad():
-        expected = ref.forward_sequence(X_SEQ)
-    n = cls(init_hidden=True, preallocated=True, validate=False, **kwargs)
-    got = n.infer_sequence(X_SEQ)
-    assert got.shape == X_SEQ.shape
-    assert torch.equal(got, expected)
 
 
 @pytest.mark.parametrize("cls,kwargs", NEURONS)
@@ -665,11 +582,10 @@ def test_hidden_buffer_replaced_by_setattr_still_registered():
 
 
 def test_extra_repr_includes_shared_options():
-    n = LIF(beta=0.9, size=16, init_hidden=True, preallocated=True)
+    n = LIF(beta=0.9, size=16, init_hidden=True)
     r = repr(n)
     assert "size=16" in r
     assert "init_hidden=True" in r
-    assert "preallocated=True" in r
     n2 = LIF(beta=0.9)
     assert "init_hidden=False" in repr(n2)
 
@@ -782,16 +698,6 @@ def test_compile_sequence_scan_routes_through_fused_hook():
     assert n._fused_forward_sequence is not None
     spk = cast(torch.Tensor, n.forward_sequence(X_SEQ))
     assert spk.shape == (T, B, F)
-
-
-@pytest.mark.parametrize("cls,kwargs", NEURONS)
-def test_infer_sequence_preallocated_path(cls, kwargs):
-    ref = cls(init_hidden=True, preallocated=True, validate=False, **kwargs)
-    n = cls(init_hidden=True, preallocated=True, validate=False, **kwargs)
-    with torch.no_grad():
-        expected = ref.forward_sequence(X_SEQ)
-    got = n.infer_sequence(X_SEQ)
-    assert torch.equal(got, expected)
 
 
 def test_hard_zero_reset_matches_zero_reset_on_spikes():

@@ -36,13 +36,3 @@ def test_validate_off_not_slower_than_on():
     t_on = _timed(lambda: on.forward_sequence(x))
     t_off = _timed(lambda: off.forward_sequence(x))
     assert t_off <= t_on * 1.5
-
-
-def test_preallocated_not_slower_than_standard():
-    x = torch.randn(T, B, F)
-    standard = LIF(beta=0.9, init_hidden=True, validate=False)
-    prealloc = LIF(beta=0.9, init_hidden=True, preallocated=True, validate=False)
-    with torch.no_grad():
-        t_s = _timed(lambda: standard.forward_sequence(x))
-        t_p = _timed(lambda: prealloc.forward_sequence(x))
-    assert t_p <= t_s * 2.0

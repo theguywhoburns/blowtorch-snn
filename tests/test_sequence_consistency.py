@@ -89,22 +89,6 @@ def test_fused_hook_consumer_matches_default():
     assert torch.equal(out_plain[0], out_fused[0])
 
 
-def test_infer_sequence_matches_no_grad_sequence():
-    torch.manual_seed(0)
-    hidden_pre = LIF(beta=0.9, init_hidden=True, preallocated=True)
-    hidden_ref = LIF(beta=0.9, init_hidden=True)
-    hidden_ref.load_state_dict(hidden_pre.state_dict())
-
-    x_seq = torch.randn(6, 3, 5)
-
-    with torch.no_grad():
-        spikes_ref = hidden_ref.forward_sequence(x_seq)
-    assert isinstance(spikes_ref, torch.Tensor)
-    spikes_infer = hidden_pre.infer_sequence(x_seq)
-
-    assert torch.equal(spikes_ref, spikes_infer)
-
-
 # Optional: only run when you want to pay the torch.compile warmup cost.
 # def test_compiled_scan_matches_reference():
 #     _, explicit = make_pair()

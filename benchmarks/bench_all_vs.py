@@ -4,9 +4,9 @@ Run from the repo root:
 
     uv run --group bench python benchmarks/bench_all_vs.py
 
-Each blowtorch neuron runs 100 timesteps through ``forward_sequence`` in five
+Each blowtorch neuron runs 100 timesteps through ``forward_sequence`` in four
 variants:
-  hidden-eager, hidden-compile, explicit-eager, explicit-compile, prealloc
+  hidden-eager, hidden-compile, explicit-eager, explicit-compile
 
 norse/snntorch only ship a LIF, so the cross-framework comparison is LIF-only
 (eager vs. torch.compile of their cell). Any framework that is missing is
@@ -56,14 +56,12 @@ NEURONS = {
 
 
 def bench_blowtorch(name: str, variant: str) -> float:
-    hidden = variant.startswith("hidden") or variant == "prealloc"
-    preallocated = variant == "prealloc"
+    hidden = variant.startswith("hidden")
     compiled = "compile" in variant
 
     neuron = NEURONS[name](
         size=FEATURES,
         init_hidden=hidden,
-        preallocated=preallocated,
         validate=False,
     ).to(DEVICE)
     if compiled:
@@ -148,7 +146,7 @@ def report(name, total, base=None):
 def main():
     print(f"device={DEVICE} batch={BATCH} features={FEATURES} steps={T}")
     results = {}
-    variants = ["hidden-eager", "hidden-compile", "explicit-eager", "explicit-compile", "prealloc"]
+    variants = ["hidden-eager", "hidden-compile", "explicit-eager", "explicit-compile"]
 
     for name in NEURONS:
         for variant in variants:
