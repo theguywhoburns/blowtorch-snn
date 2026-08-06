@@ -9,9 +9,14 @@ eight variants:
   hidden-eager, hidden-compile, explicit-eager, explicit-compile,
   plus the same four with ``pack_output`` (spikes bit-packed into int32).
 
-norse/snntorch only ship a LIF, so the cross-framework comparison is LIF-only
-(eager vs. torch.compile of their cell). Any framework that is missing is
-skipped with a note.
+norse/snntorch only ship a LIF, so the cross-framework comparison is LIF-only.
+To keep the peak-memory comparison apples-to-apples, every framework's timed
+call returns the full ``(T, B, F)`` spike stack: blowtorch returns it from
+``forward_sequence``, ``norse.LIF`` is a real sequence module that returns it,
+and snntorch (which has no sequence module) is measured with its canonical
+record-and-stack loop. Compiled rows compile the sequence unit (blowtorch's
+scan, the whole ``norse.LIF``, the snntorch cell). Any framework that is
+missing is skipped with a note.
 
 All measurements run under ``torch.no_grad()``.
 """
@@ -128,29 +133,29 @@ def bench_blowtorch(name: str, variant: str) -> tuple[float, float]:
 def bench_snntorch(compiled: bool) -> tuple[float, float]:
     import snntorch as snn
 
-    layer = snn.Leaky(beta=BETA)
+    layer = snn.Leaky(beta=BETA).to(DEVICE)
     x_seq = torch.randn(T, BATCH, FEATURES, device=DEVICE)
     mem = torch.zeros(BATCH, FEATURES, device=DEVICE)
 
     if compiled:
-        cell = torch.compile(snn.Leaky(beta=BETA).to(DEVICE))
-
-    def step(t, mem):
-        return layer(x_seq[t], mem)
-
-    if compiled:
-        def run():
-            nonlocal mem
-            with torch.no_grad():
-                for t in range(T):
-                    _, mem = cell(x_seq[t], mem)
-        return _timeit(run)
+        torch._dynamo.reset()
+        cell = torch.compile(layer)
+    else:
+        cell = layer
 
     def run():
         nonlocal mem
         with torch.no_grad():
+            out = []
             for t in range(T):
-                _, mem = layer(x_seq[t], mem)
+                spk, mem = cell(x_seq[t], mem)
+                out.append(spk)
+            # The (T, B, F) spike stack is the scan's real return value, so it
+            # stays alive during the measurement like blowtorch's
+            # forward_sequence output; snntorch ships no sequence module, this
+            # record-and-stack loop is its canonical usage.
+            return torch.stack(out)
+
     return _timeit(run)
 
 
@@ -158,17 +163,28 @@ def bench_norse(compiled: bool) -> tuple[float, float]:
     import norse.torch as norse
     from norse.torch.module.lif import LIFParameters
 
-    layer = norse.LIFCell(p=LIFParameters(alpha=torch.as_tensor(BETA)))
+    # Euler mapping to blowtorch LIF(beta=0.9) at dt=0.001: tau_mem_inv=100
+    # (membrane decays 0.9/step) and tau_syn_inv=1/dt=1000 (input current fully
+    # consumed each step -> single compartment). alpha is a no-op for 'super'.
+    p = LIFParameters(
+        tau_syn_inv=torch.as_tensor(1000.0),
+        tau_mem_inv=torch.as_tensor(100.0),
+    )
+    lif_seq = norse.LIF(p=p).to(DEVICE)
     x_seq = torch.randn(T, BATCH, FEATURES, device=DEVICE)
-    state = layer.initial_state(x_seq[0])
 
-    cell = torch.compile(layer) if compiled else layer
+    if compiled:
+        torch._dynamo.reset()
+        lif_seq = torch.compile(lif_seq)
 
     def run():
-        nonlocal state
         with torch.no_grad():
-            for t in range(T):
-                _, state = cell(x_seq[t], state)
+            # norse.LIF is the real sequence module: it loops the timesteps and
+            # returns the (T, B, F) spike stack (plus final state), so the
+            # stack stays alive during the measurement like blowtorch's output.
+            spikes, _ = lif_seq(x_seq)
+            return spikes
+
     return _timeit(run)
 
 

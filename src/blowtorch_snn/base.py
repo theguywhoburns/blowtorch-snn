@@ -27,6 +27,13 @@ Forward = Callable[..., NeuronOutput]
 StepFn = Callable[..., tuple[Tensor, ...]]
 """See ``SpikingModule``: ``_step(x, *state) -> (spk, *next_state)``."""
 
+#: Eager-mode sequence scan batch size: each chunk writes ``K`` timesteps with
+#: one ``index_copy_`` instead of one per timestep. The eager scan then runs at
+#: ``torch.stack`` speed (the per-step loop pays T tiny scatter launches; a
+#: chunked write pays ~T/K) while peak memory stays at input + output + one
+#: K-step transient instead of stack's full (T, B, F) list plus its copy.
+_SEQUENCE_SCAN_CHUNK = 8
+
 _GLOBAL_VALIDATE = True
 
 
@@ -85,6 +92,12 @@ class SpikingModuleKwargs(TypedDict, total=False):
     init_hidden: bool
     validate: Optional[bool]
     use_fused_sequence: bool
+
+    #: Bit-pack returned spikes into ``int32`` (32 per word). WARN: preferred
+    #: in compiled mode (``fast_sequence_``/``compile_sequence_scan``) where the
+    #: pack fuses into the scan and peak memory drops; in plain eager mode the
+    #: float ``(T, B, F)`` stack stays live while it is packed, so peak memory
+    #: is not reduced.
     pack_output: bool
 
 
@@ -377,6 +390,24 @@ class SpikingModule(nn.Module):
         use_fused_sequence: bool = False,
         pack_output: bool = False,
     ):
+        """Construct a spiking layer.
+
+        Args:
+            size: number of features. ``None`` infers from the input.
+            init_hidden: ``True`` for hidden-mode layers (state held as module
+                buffers, sequence scans reject an explicit initial state).
+            validate: override the module-level validation default (input and
+                state range/shape checks).
+            use_fused_sequence: route ``forward_sequence`` through
+                ``_fused_forward_sequence`` when assigned.
+            pack_output: bit-pack returned spikes into ``int32`` (32 per word).
+
+                WARN: preferred in compiled mode (``fast_sequence_`` /
+                ``compile_sequence_scan``): the pack then fuses into the scan
+                and peak memory drops (spikes stored 32x smaller). In plain
+                eager mode the ``(T, B, F)`` float stack stays live while it is
+                packed, so peak memory is not reduced.
+        """
         super().__init__()
         self.size = size
         self.init_hidden = init_hidden
@@ -971,6 +1002,13 @@ class SpikingModule(nn.Module):
         spikes are bit-packed ``int32`` (32 per word, see :func:`pack_spikes`);
         the module state stays float.
 
+        WARN: ``pack_output`` is preferred in compiled mode (``fast_sequence_``
+        / ``compile_sequence_scan``). The scan packs the stacked ``(T, B, F)``
+        output once; under ``torch.compile`` that pack fuses into the scan and
+        the float stack never materializes, giving the memory win. In plain
+        eager mode the float stack is held while it is packed, so peak memory
+        is not reduced and may exceed the unpacked scan.
+
         If ``use_fused_sequence`` is set and ``_fused_forward_sequence`` has
         been assigned (e.g. by a kernel package, or by a neuron shipping its
         own reference implementation), that implementation is used instead of
@@ -1011,7 +1049,7 @@ class SpikingModule(nn.Module):
         return self._reference_explicit_sequence_scan(x_seq, state)
 
     def _hidden_sequence_scan(self, x_seq: Tensor) -> Tensor:
-        """Hidden-mode sequence scan, optionally packing spikes per step."""
+        """Hidden-mode sequence scan, optionally bit-packing the spike output."""
         if torch.is_grad_enabled() and self.training:
             if not getattr(self, "_warned_hidden_sequence_train", False):
                 warnings.warn(
@@ -1027,7 +1065,33 @@ class SpikingModule(nn.Module):
         # check is constant work.
         self._prepare_hidden(x_seq[0])
 
-        spikes = torch.stack([self._hidden_step(x_t) for x_t in x_seq])
+        # Write each step's spikes into a preallocated (T, B, F) output with a
+        # constant-index index_copy_ instead of collecting a list and calling
+        # torch.stack. The list holds every per-step (B, F) tensor alive while
+        # stack copies it, adding a full (T, B, F) of transient peak memory
+        # (~12.5 MiB here); preallocating keeps peak at input + output. Under
+        # torch.compile, constant-index index_copy_ lowers to a plain
+        # contiguous store fused into that step's kernel, so the compiled path
+        # keeps the same fusion/runtime as the old torch.stack version. In
+        # plain eager the per-step scatter launches are the slow spot, so eager
+        # batches K steps into a single index_copy_ (see _SEQUENCE_SCAN_CHUNK):
+        # ~T/K launches instead of T, matching torch.stack's eager speed while
+        # keeping peak at input + output plus only a K-step transient.
+        spikes = torch.empty_like(x_seq)
+        if torch.compiler.is_compiling():
+            for t, x_t in enumerate(x_seq):
+                spikes.index_copy_(
+                    0,
+                    torch.tensor([t], device=x_seq.device),
+                    self._hidden_step(x_t).unsqueeze(0),
+                )
+        else:
+            K = _SEQUENCE_SCAN_CHUNK
+            idx = torch.arange(x_seq.shape[0], device=x_seq.device)
+            for lo in range(0, x_seq.shape[0], K):
+                hi = min(lo + K, x_seq.shape[0])
+                chunk = [self._hidden_step(x_t) for x_t in x_seq[lo:hi]]
+                spikes.index_copy_(0, idx[lo:hi], torch.stack(chunk))
 
         if self.pack_output:
             # Pack once after the scan instead of per step. Per-step packing
@@ -1035,6 +1099,10 @@ class SpikingModule(nn.Module):
             # which makes torch.compile's O(N^2) fusion scheduler / codegen
             # explode on long sequences. The float scan fuses fast; pack once on
             # the stacked (T, B, F) output for the same compressed result.
+            # WARN: this boundary pack only delivers its memory win under
+            # torch.compile (the pack fuses and the float stack is not held);
+            # in eager the float stack stays live while it is packed, so peak
+            # memory is not reduced.
             return pack_spikes(spikes)
 
         return spikes
@@ -1046,14 +1114,45 @@ class SpikingModule(nn.Module):
     ) -> tuple[Tensor, ...]:
         state = self._prepare_explicit_sequence_state(x_seq, state)
 
-        spike_list: list[Tensor] = []
-        cur = state
-        for t in range(x_seq.shape[0]):
-            out = self.forward(x_seq[t], *cur)
-            assert isinstance(out, tuple)
-            spike_list.append(out[0])
-            cur = out[1:]
-        spikes = torch.stack(spike_list)
+        # Same preallocated-output collection as _hidden_sequence_scan: write
+        # each step into a (T, B, F) buffer via constant-index index_copy_ so
+        # eager peak stays at input + output (no (B, F) list held for stack)
+        # while torch.compile fuses the store into each step's kernel. The
+        # buffer dtype follows the step output (state may carry a different
+        # dtype than x_seq, and torch.stack preserved that). In eager, K steps
+        # are batched into one index_copy_ (see _SEQUENCE_SCAN_CHUNK) to match
+        # torch.stack's speed without its (T, B, F) list + copy peak.
+        first = self.forward(x_seq[0], *state)
+        assert isinstance(first, tuple)
+        spikes = torch.empty(
+            (x_seq.shape[0], *first[0].shape),
+            dtype=first[0].dtype,
+            device=first[0].device,
+        )
+        spikes.index_copy_(
+            0, torch.tensor([0], device=first[0].device), first[0].unsqueeze(0)
+        )
+        cur = first[1:]
+        if torch.compiler.is_compiling():
+            for t in range(1, x_seq.shape[0]):
+                out = self.forward(x_seq[t], *cur)
+                assert isinstance(out, tuple)
+                spikes.index_copy_(
+                    0, torch.tensor([t], device=out[0].device), out[0].unsqueeze(0)
+                )
+                cur = out[1:]
+        else:
+            K = _SEQUENCE_SCAN_CHUNK
+            idx = torch.arange(x_seq.shape[0], device=spikes.device)
+            for lo in range(1, x_seq.shape[0], K):
+                hi = min(lo + K, x_seq.shape[0])
+                chunk = []
+                for t in range(lo, hi):
+                    out = self.forward(x_seq[t], *cur)
+                    assert isinstance(out, tuple)
+                    chunk.append(out[0])
+                    cur = out[1:]
+                spikes.index_copy_(0, idx[lo:hi], torch.stack(chunk))
 
         if self.pack_output:
             # Pack once after the scan instead of per step, mirroring
@@ -1062,6 +1161,8 @@ class SpikingModule(nn.Module):
             # torch.compile's O(N^2) fusion scheduler / codegen explode on long
             # sequences. The float scan fuses fast; pack once on the stacked
             # (T, B, F) output for the same compressed result.
+            # WARN: see the note at _hidden_sequence_scan -- the memory win
+            # shows up under torch.compile, not in plain eager mode.
             spikes = pack_spikes(spikes)
 
         return (spikes, *cur)
