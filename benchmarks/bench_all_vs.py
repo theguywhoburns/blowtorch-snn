@@ -4,9 +4,10 @@ Run from the repo root:
 
     uv run --group bench python benchmarks/bench_all_vs.py
 
-Each blowtorch neuron runs 100 timesteps through ``forward_sequence`` in four
-variants:
-  hidden-eager, hidden-compile, explicit-eager, explicit-compile
+Each blowtorch neuron runs 100 timesteps through ``forward_sequence`` in
+eight variants:
+  hidden-eager, hidden-compile, explicit-eager, explicit-compile,
+  plus the same four with ``pack_output`` (spikes bit-packed into int32).
 
 norse/snntorch only ship a LIF, so the cross-framework comparison is LIF-only
 (eager vs. torch.compile of their cell). Any framework that is missing is
@@ -58,26 +59,39 @@ NEURONS = {
 def bench_blowtorch(name: str, variant: str) -> float:
     hidden = variant.startswith("hidden")
     compiled = "compile" in variant
+    packed = "packed" in variant
 
+    t = time.perf_counter()
     neuron = NEURONS[name](
         size=FEATURES,
         init_hidden=hidden,
         validate=False,
+        pack_output=packed,
     ).to(DEVICE)
+    build = time.perf_counter() - t
+
+    compile_t = 0.0
     if compiled:
         # All neurons compile the same shared ``_reference_sequence_scan``
         # code object, so torch.compile's per-code-object cache (8 entries by
         # default) is exhausted once a few distinct neurons/variants compile in
         # one process -- later neurons silently fall back to eager. Reset dynamo
         # so each compiled run gets a clean, unbounded-by-cache budget and every
-        # neuron is genuinely measured as compiled, not silently eager.
+        # neuron is genuinely measured as compiled, not silently eager. This is
+        # cheap because ``fast_sequence_`` compiles with ``mode="default"``
+        # (~2s per variant); CUDA-graph capture made this unusably slow, hence
+        # ``reduce-overhead`` is never used here.
         torch._dynamo.reset()
+        t = time.perf_counter()
         neuron.fast_sequence_(mode="default")
+        compile_t = time.perf_counter() - t
 
+    t = time.perf_counter()
     x_seq = torch.randn(T, BATCH, FEATURES, device=DEVICE)
     state = None
     if not hidden:
         state = neuron.initial_state_for_sequence(x_seq)
+    setup = time.perf_counter() - t
 
     def run():
         with torch.no_grad(), bsnn.no_validation():
@@ -85,7 +99,16 @@ def bench_blowtorch(name: str, variant: str) -> float:
                 return neuron.forward_sequence(x_seq)
             return neuron.forward_sequence(x_seq, state)
 
-    return _timeit(run)
+    t = time.perf_counter()
+    best = _timeit(run)
+    measure = time.perf_counter() - t
+    print(
+        f"  [{name:>11} {variant:<24}] build={build*1e3:6.1f}ms "
+        f"compile={compile_t*1e3:8.1f}ms setup={setup*1e3:6.1f}ms "
+        f"measure={measure*1e3:8.1f}ms best={best*1e3:7.3f}ms",
+        flush=True,
+    )
+    return best
 
 
 def bench_snntorch(compiled: bool) -> float:
@@ -146,7 +169,16 @@ def report(name, total, base=None):
 def main():
     print(f"device={DEVICE} batch={BATCH} features={FEATURES} steps={T}")
     results = {}
-    variants = ["hidden-eager", "hidden-compile", "explicit-eager", "explicit-compile"]
+    variants = [
+        "hidden-eager",
+        "hidden-compile",
+        "explicit-eager",
+        "explicit-compile",
+        "hidden-eager-packed",
+        "hidden-compile-packed",
+        "explicit-eager-packed",
+        "explicit-compile-packed",
+    ]
 
     for name in NEURONS:
         for variant in variants:

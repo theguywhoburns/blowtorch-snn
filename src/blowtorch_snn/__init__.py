@@ -21,6 +21,7 @@ from .base import (
     no_validation,
     SequenceOutput,
 )
+from .pack import pack_spikes, unpack_spikes
 from .neurons.lif import LIF
 from .neurons.qif import QIF
 from .neurons.izhikevich import Izhikevich, IzhPreset, IzhParams
@@ -49,6 +50,8 @@ __all__ = [
     "no_reset",
     "no_validation",
     "SequenceOutput",
+    "pack_spikes",
+    "unpack_spikes",
     "LIF",
     "QIF",
     "Izhikevich",

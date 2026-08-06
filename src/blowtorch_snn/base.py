@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, Optional, TypedDict, Unpack
 
+from .pack import pack_spikes
+
 Tensor = torch.Tensor
 
 NeuronOutput = Tensor | tuple[Tensor, ...]
@@ -83,6 +85,7 @@ class SpikingModuleKwargs(TypedDict, total=False):
     init_hidden: bool
     validate: Optional[bool]
     use_fused_sequence: bool
+    pack_output: bool
 
 
 @dataclass(frozen=True)
@@ -372,12 +375,14 @@ class SpikingModule(nn.Module):
         init_hidden: bool = False,
         validate: Optional[bool] = None,
         use_fused_sequence: bool = False,
+        pack_output: bool = False,
     ):
         super().__init__()
         self.size = size
         self.init_hidden = init_hidden
         self._validate_override = validate
         self.use_fused_sequence = use_fused_sequence
+        self.pack_output = pack_output
         self._fused_forward_sequence: Optional[FusedSequenceFn] = None
         self._range_warn_counts: dict[str, int] = {}
         if use_fused_sequence:
@@ -962,6 +967,10 @@ class SpikingModule(nn.Module):
         tuple (``None`` means a fresh ``initial_state``) and
         ``(spikes, *final_state)`` is returned.
 
+        If the module was constructed with ``pack_output=True``, the returned
+        spikes are bit-packed ``int32`` (32 per word, see :func:`pack_spikes`);
+        the module state stays float.
+
         If ``use_fused_sequence`` is set and ``_fused_forward_sequence`` has
         been assigned (e.g. by a kernel package, or by a neuron shipping its
         own reference implementation), that implementation is used instead of
@@ -983,6 +992,11 @@ class SpikingModule(nn.Module):
         default loop a fused implementation must reproduce numerically; it is
         also what ``forward_sequence`` falls back to when no fused
         implementation is wired up.
+
+        With ``pack_output`` set at construction, spikes are bit-packed into
+        ``int32`` (32 per word) once on the stacked output in both modes. The
+        module state stays float and the returned tensor carries packed spikes.
+        See :func:`pack_spikes`.
         """
         self._check_sequence_input(x_seq, "forward_sequence")
 
@@ -992,11 +1006,12 @@ class SpikingModule(nn.Module):
                     f"{self.neuron_name} hidden forward_sequence takes no "
                     f"initial state; it evolves the module buffers"
                 )
-            return self._reference_hidden_sequence_scan(x_seq)
+            return self._hidden_sequence_scan(x_seq)
 
         return self._reference_explicit_sequence_scan(x_seq, state)
 
-    def _reference_hidden_sequence_scan(self, x_seq: Tensor) -> Tensor:
+    def _hidden_sequence_scan(self, x_seq: Tensor) -> Tensor:
+        """Hidden-mode sequence scan, optionally packing spikes per step."""
         if torch.is_grad_enabled() and self.training:
             if not getattr(self, "_warned_hidden_sequence_train", False):
                 warnings.warn(
@@ -1011,7 +1026,18 @@ class SpikingModule(nn.Module):
         # every step: every row of x_seq shares one shape, so the per-step
         # check is constant work.
         self._prepare_hidden(x_seq[0])
-        return torch.stack([self._hidden_step(x_t) for x_t in x_seq])
+
+        spikes = torch.stack([self._hidden_step(x_t) for x_t in x_seq])
+
+        if self.pack_output:
+            # Pack once after the scan instead of per step. Per-step packing
+            # injects ~T reduction ops into the fused graph (one per timestep),
+            # which makes torch.compile's O(N^2) fusion scheduler / codegen
+            # explode on long sequences. The float scan fuses fast; pack once on
+            # the stacked (T, B, F) output for the same compressed result.
+            return pack_spikes(spikes)
+
+        return spikes
 
     def _reference_explicit_sequence_scan(
         self,
@@ -1027,7 +1053,18 @@ class SpikingModule(nn.Module):
             assert isinstance(out, tuple)
             spike_list.append(out[0])
             cur = out[1:]
-        return (torch.stack(spike_list), *cur)
+        spikes = torch.stack(spike_list)
+
+        if self.pack_output:
+            # Pack once after the scan instead of per step, mirroring
+            # _hidden_sequence_scan: per-step packing injects ~T reduction ops
+            # into the fused graph (one per timestep), which makes
+            # torch.compile's O(N^2) fusion scheduler / codegen explode on long
+            # sequences. The float scan fuses fast; pack once on the stacked
+            # (T, B, F) output for the same compressed result.
+            spikes = pack_spikes(spikes)
+
+        return (spikes, *cur)
 
     def compile_sequence_scan(self, **kwargs) -> None:
         """Compile the reference sequence scan and route through the fused hook.
@@ -1069,17 +1106,14 @@ class SpikingModule(nn.Module):
         production guarantee. It keeps explicit-mode semantics while reducing
         Python-level overhead where possible.
 
-        ``mode="reduce-overhead"`` (CUDA graphs) is the default for explicit
-        modules, which are graph-friendly. Hidden-mode scans re-register their
-        state buffers every step, which is incompatible with CUDA graph
-        capture, so they fall back to ``mode="default"``.
+        ``mode="default"`` is always used. ``reduce-overhead`` (CUDA graphs)
+        is avoided: it is significantly slower to (re)compile and gains little
+        at the short sequence lengths typical of prototyping, and it is
+        incompatible with hidden-mode state registration anyway.
         """
         self.validate = False
         if compile_scan:
-            if self.init_hidden:
-                compile_kwargs.setdefault("mode", "default")
-            else:
-                compile_kwargs.setdefault("mode", "reduce-overhead")
+            compile_kwargs.setdefault("mode", "default")
             self.compile_sequence_scan(**compile_kwargs)
         return self
 
