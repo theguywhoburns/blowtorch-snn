@@ -32,7 +32,20 @@ def _sync():
         torch.cuda.synchronize()
 
 
+def _reset_peak():
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+
+def _peak_mib():
+    if DEVICE == "cuda":
+        return torch.cuda.max_memory_allocated() / 2**20
+    return 0.0
+
+
 def _timeit(fn):
+    _reset_peak()
     for _ in range(WARMUP):
         fn()
         _sync()
@@ -43,7 +56,7 @@ def _timeit(fn):
         fn()
         _sync()
         best = min(best, time.perf_counter() - start)
-    return best
+    return best, _peak_mib()
 
 
 NEURONS = {
@@ -56,7 +69,7 @@ NEURONS = {
 }
 
 
-def bench_blowtorch(name: str, variant: str) -> float:
+def bench_blowtorch(name: str, variant: str) -> tuple[float, float]:
     hidden = variant.startswith("hidden")
     compiled = "compile" in variant
     packed = "packed" in variant
@@ -100,18 +113,19 @@ def bench_blowtorch(name: str, variant: str) -> float:
             return neuron.forward_sequence(x_seq, state)
 
     t = time.perf_counter()
-    best = _timeit(run)
+    best, peak = _timeit(run)
     measure = time.perf_counter() - t
     print(
         f"  [{name:>11} {variant:<24}] build={build*1e3:6.1f}ms "
         f"compile={compile_t*1e3:8.1f}ms setup={setup*1e3:6.1f}ms "
-        f"measure={measure*1e3:8.1f}ms best={best*1e3:7.3f}ms",
+        f"measure={measure*1e3:8.1f}ms best={best*1e3:7.3f}ms "
+        f"peak={peak:6.1f}MiB",
         flush=True,
     )
-    return best
+    return best, peak
 
 
-def bench_snntorch(compiled: bool) -> float:
+def bench_snntorch(compiled: bool) -> tuple[float, float]:
     import snntorch as snn
 
     layer = snn.Leaky(beta=BETA)
@@ -140,7 +154,7 @@ def bench_snntorch(compiled: bool) -> float:
     return _timeit(run)
 
 
-def bench_norse(compiled: bool) -> float:
+def bench_norse(compiled: bool) -> tuple[float, float]:
     import norse.torch as norse
     from norse.torch.module.lif import LIFParameters
 
@@ -158,9 +172,9 @@ def bench_norse(compiled: bool) -> float:
     return _timeit(run)
 
 
-def report(name, total, base=None):
+def report(name, total, peak, base=None):
     ms = total * 1e3
-    line = f"{name:<34} {ms:>10.3f} ms  {T / total:>10.0f} steps/s"
+    line = f"{name:<34} {ms:>10.3f} ms  {T / total:>10.0f} steps/s  {peak:>7.1f} MiB"
     if base is not None and base:
         line += f"  ({total / base:>5.2f}x)"
     print(line)
@@ -184,13 +198,15 @@ def main():
         for variant in variants:
             key = f"bsnn {name:<10} {variant}"
             try:
-                results[key] = bench_blowtorch(name, variant)
-                report(key, results[key])
+                best, peak = bench_blowtorch(name, variant)
+                results[key] = (best, peak)
+                report(key, best, peak)
             except Exception as exc:  # noqa: BLE001 - surface failures loudly
                 print(f"{key} ERROR: {exc}")
         print()
 
     base = results.get("bsnn LIF        hidden-eager")
+    base_time = base[0] if base else None
     for label, fn in (
         ("snntorch eager", lambda: bench_snntorch(False)),
         ("snntorch compile", lambda: bench_snntorch(True)),
@@ -199,8 +215,9 @@ def main():
     ):
         key = f"{label}"
         try:
-            results[key] = fn()
-            report(key, results[key], base)
+            best, peak = fn()
+            results[key] = (best, peak)
+            report(key, best, peak, base_time)
         except ImportError:
             print(f"{key} SKIPPED (not installed)")
         except Exception as exc:  # noqa: BLE001
